@@ -1,0 +1,42 @@
+/* 登录页：Sonner 垂直居中（在 top-center 基础上改为视口中心） */
+.login-toaster[data-sonner-toaster][data-x-position="center"][data-y-position="top"] {
+  top: 50% !important;
+  left: 50% !important;
+  right: auto !important;
+  bottom: auto !important;
+  transform: translate(-50%, -50%) !important;
+  width: min(92vw, 380px) !important;
+  max-width: 380px !important;
+}
+
+.login-toaster[data-sonner-toaster][data-x-position="center"][data-y-position="top"][data-lifted] {
+  transform: translate(-50%, calc(-50% - 6px)) !important;
+}
+
+@media (max-width: 600px) {
+  .login-toaster[data-sonner-toaster][data-x-position="center"] {
+    left: 50% !important;
+    right: auto !important;
+    width: min(92vw, 380px) !important;
+    transform: translate(-50%, -50%) !important;
+  }
+}
+
+/* 失败提示：更圆润、轻阴影、与主色呼应 */
+.login-toaster [data-sonner-toast][data-type="error"] {
+  border-radius: 1rem !important;
+  padding: 1rem 1.125rem !important;
+  font-size: 0.9375rem !important;
+  font-weight: 500 !important;
+  line-height: 1.45 !important;
+  box-shadow:
+    0 24px 48px -12px rgba(21, 93, 252, 0.12),
+    0 0 0 1px rgba(212, 24, 61, 0.12),
+    0 8px 16px -8px rgba(0, 0, 0, 0.12) !important;
+  backdrop-filter: blur(12px);
+}
+
+.login-toaster [data-sonner-toast][data-type="error"] [data-title] {
+  font-weight: 600 !important;
+  letter-spacing: 0.01em;
+}

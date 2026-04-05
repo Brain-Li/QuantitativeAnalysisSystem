@@ -1,0 +1,21 @@
+{
+  "name": "quant-analysis-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "股票数据分析可视化平台 - 配套后端（Express + SQLite）",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.1",
+    "xlsx": "^0.18.5"
+  }
+}
