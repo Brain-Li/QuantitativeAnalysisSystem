@@ -45,7 +45,7 @@ npm run dev
 | 项目 | 值 |
 |------|-----|
 | 用户名 | `admin`（可用环境变量 `ADMIN_USER` 覆盖） |
-| 密码 | `admin123`（与现有前端 `authApi` 演示一致） |
+| 密码 | 由 `.env` 中 `INITIAL_ADMIN_PASSWORD` 决定（勿使用仓库中的示例占位；首次部署务必自行设置） |
 
 登录成功后，后续接口在请求头携带：
 
@@ -68,7 +68,7 @@ Authorization: Bearer <token>
 请求体：
 
 ```json
-{ "username": "admin", "password": "admin123" }
+{ "username": "admin", "password": "<与 .env 中 INITIAL_ADMIN_PASSWORD 一致>" }
 ```
 
 成功：
@@ -145,9 +145,9 @@ Authorization: Bearer <token>
 ## 数据模型与性能
 
 - **datasets**：数据集元信息与 `fields_json`（列名列表）
-- **stock_rows**：`code`、`name`、`date_str`、`volatility`（便于索引与排序）、`payload_json`（完整一行）
-- 索引：`dataset_id + code`、`dataset_id + date_str`、`dataset_id + name`、`dataset_id + volatility`
-- WAL 模式、批量事务写入，适合约 **5500 行 × 多列** 日更场景
+- **stock_rows**：`code`、`name`、`date_str`、`volatility`、`payload_json`（完整一行；涨跌幅多在 JSON 列 `涨跌幅`）
+- 索引：已去掉对 `(dataset_id, code)` 的辅助索引；保留 `dataset_id + date_str`、`dataset_id + name`；**`dataset_id + volatility`**；**`dataset_id + json_extract(payload_json,'$.涨跌幅')`**（便于按波动率/涨跌幅筛选排序；Excel 列名须为 `涨跌幅` 方命中该表达式索引）
+- WAL 模式、批量事务写入（单文件入库约每 **1000** 行一批）；适合约 **5500 行 × 多列** 日更场景
 
 ## 腾讯云 EdgeOne / 静态托管
 
