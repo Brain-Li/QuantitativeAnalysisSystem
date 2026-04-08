@@ -76,6 +76,7 @@ import {
   isZhangDieFuField,
   zhangDieFuStyle,
 } from '../utils/fieldDisplayFormat';
+import { parseToDateStr } from '../utils/tableDataPipeline';
 
 interface StockTrendAnalysisProps {
   data: StockData[];
@@ -1937,17 +1938,26 @@ export function StockTrendAnalysis({
     );
   }, [stockOptions, metricFields]);
 
-  // ── Filter data for a chart
+  // ── Filter data for a chart（与 DataTable 一致：先 parseToDateStr 再比 YYYY-MM-DD，避免 "2025-04-08 00:00:00" 与 "2025-04-08" 字符串比较把当日数据滤掉）
   const filterData = (stocks: string[], from: string, to: string) => {
     if (!stockFilterField) return [];
     let rows = effectiveData.filter((row) =>
       stocks.includes(String(row[stockFilterField] ?? '')),
     );
-    if (from) rows = rows.filter((row) => String(row[dateField] ?? '') >= from);
-    if (to) rows = rows.filter((row) => String(row[dateField] ?? '') <= to);
-    return rows.sort((a, b) =>
-      String(a[dateField] ?? '').localeCompare(String(b[dateField] ?? '')),
-    );
+    if (from || to) {
+      rows = rows.filter((row) => {
+        const ds = parseToDateStr(row[dateField] as string | number | Date | null);
+        if (!ds) return true;
+        if (from && ds < from) return false;
+        if (to && ds > to) return false;
+        return true;
+      });
+    }
+    return rows.sort((a, b) => {
+      const da = parseToDateStr(a[dateField] as string | number | Date | null);
+      const db = parseToDateStr(b[dateField] as string | number | Date | null);
+      return (da ?? String(a[dateField] ?? '')).localeCompare(db ?? String(b[dateField] ?? ''));
+    });
   };
 
   const applyDateRange = (range?: DateRange) => {

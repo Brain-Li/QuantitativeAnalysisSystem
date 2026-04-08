@@ -44,6 +44,7 @@ import {
   DialogTitle,
 } from "./ui/dialog";
 import { isValidNewPassword } from "../utils/passwordRules";
+import { formatSqliteUtcForLocale } from "../utils/sqliteUtcDisplay";
 import { cn } from "./ui/utils";
 import { ConfirmDeleteDialog } from "./ConfirmDeleteDialog";
 import {
@@ -469,7 +470,9 @@ export function AdminAccountModule() {
                             {u.disabled ? "禁用" : "启用"}
                           </span>
                         </td>
-                        <td className="px-4 py-2.5 tabular-nums text-muted-foreground">{u.createdAt}</td>
+                        <td className="px-4 py-2.5 tabular-nums text-muted-foreground">
+                          {formatSqliteUtcForLocale(u.createdAt)}
+                        </td>
                         <td className="px-4 py-2.5 text-right">
                           <div className="flex flex-wrap justify-end gap-1.5">
                             <Button
@@ -598,7 +601,7 @@ export function AdminAccountModule() {
                           logs.map((l) => (
                             <tr key={l.id} className="border-b border-border/80">
                               <td className="whitespace-nowrap px-4 py-3.5 align-middle tabular-nums text-muted-foreground">
-                                {l.createdAt}
+                                {formatSqliteUtcForLocale(l.createdAt)}
                               </td>
                               <td className="px-4 py-3.5 align-middle">{l.username}</td>
                               <td className="px-4 py-3.5 align-middle">{l.action}</td>
