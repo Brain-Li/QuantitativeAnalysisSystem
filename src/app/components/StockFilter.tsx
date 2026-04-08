@@ -1,5 +1,5 @@
-import { useState, useMemo, useRef, useEffect } from 'react';
-import { Search, X, ChevronDown, ChevronUp } from 'lucide-react';
+import { useState, useMemo, useRef, useEffect, useCallback, useDeferredValue } from 'react';
+import { Search, X, ChevronDown, ChevronUp, Loader2 } from 'lucide-react';
 import { Button } from './ui/button';
 import { Checkbox } from './ui/checkbox';
 import { VirtualStockList } from './VirtualStockList';
@@ -13,14 +13,22 @@ interface StockFilterProps {
   options: StockOption[];
   selected: string[];
   onChange: (stocks: string[]) => void;
+  /** 服务端拉 distinct-codes 期间为 true：按钮禁用并提示加载 */
+  optionsLoading?: boolean;
 }
 
-export function StockFilter({ options, selected, onChange }: StockFilterProps) {
+export function StockFilter({ options, selected, onChange, optionsLoading = false }: StockFilterProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const containerRef = useRef<HTMLDivElement>(null);
 
+  useEffect(() => {
+    if (optionsLoading) setOpen(false);
+  }, [optionsLoading]);
+
   const selectedSet = useMemo(() => new Set(selected), [selected]);
+
+  const deferredQuery = useDeferredValue(query);
 
   useEffect(() => {
     if (!open) return;
@@ -40,19 +48,32 @@ export function StockFilter({ options, selected, onChange }: StockFilterProps) {
     };
   }, [open]);
 
-  const filtered = useMemo(() => {
-    if (!query) return options;
-    const q = query.toLowerCase();
-    return options.filter(
-      (s) => s.code.toLowerCase().includes(q) || s.name.toLowerCase().includes(q)
-    );
-  }, [options, query]);
+  /** options 不变时复用小写串，避免每次按键对全表做 toLowerCase */
+  const optionsLc = useMemo(
+    () => options.map((o) => [o.code.toLowerCase(), o.name.toLowerCase()] as const),
+    [options],
+  );
 
-  const toggle = (code: string) => {
-    onChange(
-      selected.includes(code) ? selected.filter((s) => s !== code) : [...selected, code]
-    );
-  };
+  const filtered = useMemo(() => {
+    if (!deferredQuery) return options;
+    const q = deferredQuery.toLowerCase();
+    const out: StockOption[] = [];
+    for (let i = 0; i < options.length; i++) {
+      const o = options[i]!;
+      const [c, n] = optionsLc[i]!;
+      if (c.includes(q) || n.includes(q)) out.push(o);
+    }
+    return out;
+  }, [options, optionsLc, deferredQuery]);
+
+  const toggle = useCallback(
+    (code: string) => {
+      onChange(
+        selected.includes(code) ? selected.filter((s) => s !== code) : [...selected, code],
+      );
+    },
+    [selected, onChange],
+  );
 
   const allSelected =
     options.length > 0 &&
@@ -65,25 +86,35 @@ export function StockFilter({ options, selected, onChange }: StockFilterProps) {
     else onChange(options.map((o) => o.code));
   };
 
-  const buttonLabel = () => {
+  const buttonLabel = useMemo(() => {
+    if (optionsLoading && options.length === 0 && selected.length === 0) {
+      return '股票列表加载中…';
+    }
     if (selected.length === 0) return '选择股票';
     if (selected.length === 1) {
       const stock = options.find((s) => s.code === selected[0]);
       return stock ? `${stock.code} ${stock.name}` : selected[0];
     }
     return `已选 ${selected.length} 只股票`;
-  };
+  }, [selected, options, optionsLoading]);
 
   return (
     <div ref={containerRef} className="relative">
       <Button
         variant="outline"
         size="sm"
+        disabled={optionsLoading}
         className={`gap-2 ${selected.length > 0 ? 'border-primary/50 text-primary' : ''}`}
-        onClick={() => setOpen(!open)}
+        onClick={() => {
+          if (optionsLoading) return;
+          setOpen(!open);
+        }}
       >
-        <span className="text-[14px] leading-snug">{buttonLabel()}</span>
-        {selected.length > 0 && (
+        {optionsLoading ? (
+          <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin text-muted-foreground" aria-hidden />
+        ) : null}
+        <span className="text-[14px] leading-snug">{buttonLabel}</span>
+        {selected.length > 0 && !optionsLoading && (
           <span
             className="ml-0.5 text-muted-foreground hover:text-foreground"
             onClick={(e) => {
@@ -94,11 +125,11 @@ export function StockFilter({ options, selected, onChange }: StockFilterProps) {
             <X className="w-3 h-3" />
           </span>
         )}
-        {open ? (
+        {!optionsLoading && open ? (
           <ChevronUp className="w-3 h-3 text-muted-foreground" />
-        ) : (
+        ) : !optionsLoading ? (
           <ChevronDown className="w-3 h-3 text-muted-foreground" />
-        )}
+        ) : null}
       </Button>
 
       {open && (
@@ -120,28 +151,18 @@ export function StockFilter({ options, selected, onChange }: StockFilterProps) {
           </div>
 
           {!query && options.length > 0 && (
-            <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-border bg-muted/30">
+            <div className="flex items-center gap-2.5 px-3 py-2 border-b border-border bg-muted/30">
               <div
-                className="flex items-center gap-2.5 min-w-0 flex-1 cursor-pointer rounded-md hover:bg-muted/50 transition-colors -mx-1 px-1 py-0.5"
+                className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5 rounded-md px-1 py-0.5 -mx-1 transition-colors hover:bg-muted/50"
                 onClick={toggleAll}
               >
                 <Checkbox
                   checked={allSelected ? true : someSelected ? 'indeterminate' : false}
                   onCheckedChange={toggleAll}
                 />
-                <span className="text-sm select-none">全部股票</span>
-                <span className="text-sm text-muted-foreground tabular-nums">{options.length} 只</span>
+                <span className="select-none text-sm">全部股票</span>
+                <span className="tabular-nums text-sm text-muted-foreground">{options.length} 只</span>
               </div>
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  toggleAll();
-                }}
-                className="text-sm text-primary hover:text-primary/80 transition-colors whitespace-nowrap shrink-0"
-              >
-                {allSelected ? '取消全选' : '全选'}
-              </button>
             </div>
           )}
 

@@ -108,6 +108,48 @@ export function formatTurnoverPercentDisplay(n: number): string {
   return `${pct.toFixed(2)}%`;
 }
 
+/**
+ * 与 `formatTurnoverPercentDisplay` 同一口径的「百分号前的数值」，供筛选与展示对齐。
+ */
+export function turnoverComparablePercentPoints(raw: number): number {
+  if (!Number.isFinite(raw)) return raw;
+  const abs = Math.abs(raw);
+  if (abs >= 0.01) return raw * 100;
+  const newVal = raw * 100;
+  if (newVal === 0) return 0;
+  return Math.abs(newVal) < 0.15 ? newVal * 100 : newVal;
+}
+
+/**
+ * 与 `formatFieldCellDisplay` 同一量纲的数值，供字段条件筛选与列表展示对齐。
+ * - 涨跌幅：条文「新值=原始值/100」；常见 Excel 存 800 表示 8% 时，与界面「8.xx%」对齐用原始值/100；原始值≤100 时视为已与百分号前数字一致。
+ * - 波动率：列表为 (原始值×100) 百分数，与输入「35」「35%」对齐。
+ * - 换手率 / 成交量：同既有 `turnoverComparablePercentPoints`、万单位。
+ */
+export function getFilterComparableNumericValue(
+  field: string,
+  value: unknown,
+): number | null {
+  const n = numOrNaN(value);
+  if (!Number.isFinite(n)) return null;
+  const kind = classifyField(field);
+  switch (kind) {
+    case 'zhangdiefu': {
+      const abs = Math.abs(n);
+      if (abs > 100) return n / 100;
+      return n;
+    }
+    case 'turnover':
+      return turnoverComparablePercentPoints(n);
+    case 'volume':
+      return n / 10000;
+    case 'volatility':
+      return n * 100;
+    default:
+      return n;
+  }
+}
+
 export interface CellDisplayResult {
   text: string;
   className?: string;

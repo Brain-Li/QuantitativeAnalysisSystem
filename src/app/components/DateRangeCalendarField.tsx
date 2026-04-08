@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import type { DateRange } from 'react-day-picker';
 import { zhCN } from 'date-fns/locale';
 import { Calendar } from './ui/calendar';
+import { cn } from './ui/utils';
 
 function parseYmd(s: string): Date | undefined {
   if (!s || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return undefined;
@@ -24,12 +25,27 @@ interface DateRangeCalendarFieldProps {
   /** yyyy-MM-dd */
   end: string;
   onChange: (start: string, end: string) => void;
+  /** 并排展示月数，参考设计图为 2 */
+  numberOfMonths?: number;
+  className?: string;
+}
+
+function startOfDay(d: Date): Date {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
 }
 
 /**
- * 单面板内拖拽/点选起止日期（react-day-picker range），替代两个原生 date input。
+ * 点选 / 拖拽起止日期（react-day-picker range）；可选双月并排。
  */
-export function DateRangeCalendarField({ start, end, onChange }: DateRangeCalendarFieldProps) {
+export function DateRangeCalendarField({
+  start,
+  end,
+  onChange,
+  numberOfMonths = 2,
+  className,
+}: DateRangeCalendarFieldProps) {
   const selected: DateRange | undefined = useMemo(() => {
     const from = parseYmd(start);
     const to = parseYmd(end);
@@ -58,22 +74,34 @@ export function DateRangeCalendarField({ start, end, onChange }: DateRangeCalend
     onChange(a, b);
   };
 
+  const today = useMemo(() => startOfDay(new Date()), []);
+  const disableFuture = (d: Date) => startOfDay(d) > today;
+
   return (
-    <div className="flex w-full min-w-0 max-w-full shrink-0 justify-center">
+    <div
+      className={cn(
+        'flex w-fit min-w-0 max-w-full shrink-0 justify-start',
+        className,
+      )}
+    >
       <Calendar
-        className="!p-1 px-0.5 py-1"
+        className="!m-0 !w-fit !min-w-0 !p-0"
         classNames={{
-          months: "flex w-full flex-col gap-0",
-          month: "flex w-full flex-col items-stretch gap-1.5",
-          table: "mx-auto w-auto border-collapse space-x-1",
-          row: "mt-1 flex w-full",
+          months: cn(
+            'flex w-max max-w-none gap-2',
+            numberOfMonths > 1 ? 'flex-col sm:flex-row' : 'flex-col',
+          ),
+          month: 'flex w-fit flex-col items-stretch gap-1.5',
+          table: 'mx-auto w-auto border-collapse space-x-1',
+          row: 'mt-1 flex w-full',
         }}
         mode="range"
-        numberOfMonths={1}
+        numberOfMonths={numberOfMonths}
         locale={zhCN}
         defaultMonth={defaultMonth}
         selected={selected}
         onSelect={handleSelect}
+        disabled={disableFuture}
       />
     </div>
   );

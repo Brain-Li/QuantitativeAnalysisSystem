@@ -1,15 +1,25 @@
-import { useState } from 'react';
+import { useState, useMemo, useDeferredValue } from 'react';
 import { Database, Trash2, Clock, FileText, Search, ChevronLeft, ChevronRight, CheckSquare, Square } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Button } from './ui/button';
+import { ConfirmDeleteDialog } from './ConfirmDeleteDialog';
 import { Badge } from './ui/badge';
 import { cn } from './ui/utils';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from './ui/select';
 import type { Dataset } from '../types';
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50];
 
 interface DatasetManagerProps {
   datasets: Dataset[];
+  /** 服务端列表尚未返回时：列表区静默占位，不显示「暂无数据集」 */
+  listHydrating?: boolean;
   currentDatasetId?: string;
   onSelectDataset: (datasetId: string) => void;
   onDeleteDataset: (datasetId: string) => void;
@@ -18,52 +28,10 @@ interface DatasetManagerProps {
   className?: string;
 }
 
-// Simple confirm dialog without Radix UI
-function ConfirmDialog({
-  open,
-  onClose,
-  onConfirm,
-  title,
-  description,
-}: {
-  open: boolean;
-  onClose: () => void;
-  onConfirm: () => void;
-  title: string;
-  description: string;
-}) {
-  if (!open) return null;
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div
-        className="fixed inset-0 bg-black/50"
-        onClick={onClose}
-      />
-      <div className="relative z-50 bg-background w-full max-w-sm mx-4 rounded-lg border p-6 shadow-lg">
-        <h3 className="text-base font-semibold mb-2 leading-snug">{title}</h3>
-        <p className="text-sm leading-relaxed text-muted-foreground mb-6">{description}</p>
-        <div className="flex justify-end gap-2">
-          <Button variant="outline" size="sm" onClick={onClose}>
-            取消
-          </Button>
-          <Button
-            size="sm"
-            className="bg-destructive hover:bg-destructive/90 text-white"
-            onClick={() => {
-              onConfirm();
-              onClose();
-            }}
-          >
-            删除
-          </Button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
+/** 数据导入中的数据集列表：只支持按名称搜索；不接入全局时间筛选（勿在此加日期工具栏/按导入时间过滤）。 */
 export function DatasetManager({
   datasets,
+  listHydrating = false,
   currentDatasetId,
   onSelectDataset,
   onDeleteDataset,
@@ -86,9 +54,12 @@ export function DatasetManager({
     }).format(date);
   };
 
-  const filteredDatasets = datasets.filter((dataset) =>
-    dataset.name.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const deferredSearchQuery = useDeferredValue(searchQuery);
+  const filteredDatasets = useMemo(() => {
+    const t = deferredSearchQuery.trim().toLowerCase();
+    if (!t) return datasets;
+    return datasets.filter((dataset) => dataset.name.toLowerCase().includes(t));
+  }, [datasets, deferredSearchQuery]);
 
   const totalPages = Math.ceil(filteredDatasets.length / itemsPerPage);
   const startIndex = (currentPage - 1) * itemsPerPage;
@@ -178,10 +149,17 @@ export function DatasetManager({
         </div>
 
         {datasets.length === 0 ? (
-          <div className="text-center py-8 text-muted-foreground">
-            <FileText className="w-12 h-12 mx-auto mb-2 opacity-20" />
-            <p className="text-sm leading-relaxed">暂无数据集</p>
-          </div>
+          listHydrating ? (
+            <div
+              className="min-h-[min(40vh,240px)] shrink-0"
+              aria-busy="true"
+            />
+          ) : (
+            <div className="text-center py-8 text-muted-foreground">
+              <FileText className="w-12 h-12 mx-auto mb-2 opacity-20" />
+              <p className="text-sm leading-relaxed">暂无数据集</p>
+            </div>
+          )
         ) : filteredDatasets.length === 0 ? (
           <div className="text-center py-8 text-muted-foreground">
             <Search className="w-12 h-12 mx-auto mb-2 opacity-20" />
@@ -340,18 +318,27 @@ export function DatasetManager({
                 )}
                 <div className="flex items-center gap-1.5">
                   <span className="text-muted-foreground whitespace-nowrap">每页</span>
-                  <select
-                    value={itemsPerPage}
-                    onChange={(e) => {
-                      setItemsPerPage(Number(e.target.value));
+                  <Select
+                    value={String(itemsPerPage)}
+                    onValueChange={(v) => {
+                      setItemsPerPage(Number(v));
                       setCurrentPage(1);
                     }}
-                    className="h-8 px-2 text-sm border border-input rounded-md bg-background focus:outline-none focus:ring-1 focus:ring-primary cursor-pointer"
                   >
-                    {PAGE_SIZE_OPTIONS.map((size) => (
-                      <option key={size} value={size}>{size} 条</option>
-                    ))}
-                  </select>
+                    <SelectTrigger
+                      size="sm"
+                      className="h-8 w-[5.75rem] shrink-0 border-input bg-background px-2 text-sm"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent position="popper" sideOffset={4}>
+                      {PAGE_SIZE_OPTIONS.map((size) => (
+                        <SelectItem key={size} value={String(size)}>
+                          {size} 条
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
               </div>
             </div>
@@ -360,7 +347,7 @@ export function DatasetManager({
       </CardContent>
 
       {/* Confirm Delete Dialog */}
-      <ConfirmDialog
+      <ConfirmDeleteDialog
         open={!!deleteTarget}
         onClose={() => setDeleteTarget(null)}
         onConfirm={() => {

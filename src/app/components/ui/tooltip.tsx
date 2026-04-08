@@ -18,6 +18,9 @@ function TooltipProvider({
   );
 }
 
+/** 与 TooltipProvider 配合使用，避免表格等场景每行重复嵌套 Provider */
+const TooltipRoot = TooltipPrimitive.Root;
+
 function Tooltip({
   ...props
 }: React.ComponentProps<typeof TooltipPrimitive.Root>) {
@@ -52,10 +55,9 @@ function TooltipContent({
         {...props}
       >
         {children}
-        <TooltipPrimitive.Arrow className="bg-primary fill-primary z-50 size-2.5 translate-y-[calc(-50%_-_2px)] rotate-45 rounded-[2px]" />
       </TooltipPrimitive.Content>
     </TooltipPrimitive.Portal>
   );
 }
 
-export { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider };
+export { Tooltip, TooltipRoot, TooltipTrigger, TooltipContent, TooltipProvider };

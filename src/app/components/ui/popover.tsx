@@ -1,5 +1,5 @@
 import * as React from "react";
-import { cn } from "./utils";
+import { cn, isPointerEventInsideContainer } from "./utils";
 
 interface PopoverContextValue {
   open: boolean;
@@ -101,15 +101,26 @@ const PopoverContent = React.forwardRef<
   React.useEffect(() => {
     if (!open) return;
     const handleClick = (e: MouseEvent) => {
-      const target = e.target as Node;
-      if (
-        contentRef.current &&
-        !contentRef.current.contains(target) &&
-        triggerRef.current &&
-        !triggerRef.current.contains(target)
-      ) {
-        setOpen(false);
+      const t = e.target;
+      /** 股票筛选里「选择字段」列表通过 Portal 挂在 body 上，不在 content 内，需排除 */
+      if (t instanceof Element && t.closest("[data-stock-field-select-portal]")) {
+        return;
       }
+      /** 股票筛选里「所有/任一」「等于」自定义下拉（非 Radix Select），Portal 在 body */
+      if (t instanceof Element && t.closest("[data-stock-filter-enum-portal]")) {
+        return;
+      }
+      /** Radix Select 下拉层挂在 Portal，不在 Popover 节点内 */
+      if (t instanceof Element && t.closest('[data-slot="select-content"]')) {
+        return;
+      }
+      if (
+        isPointerEventInsideContainer(contentRef.current, e) ||
+        isPointerEventInsideContainer(triggerRef.current, e)
+      ) {
+        return;
+      }
+      setOpen(false);
     };
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);

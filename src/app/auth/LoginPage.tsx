@@ -1,12 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Navigate, useLocation, useNavigate } from "react-router";
 import { AlertCircle, ArrowRight, Eye, EyeOff, Loader2, Lock, User } from "lucide-react";
 import { useAuth } from "./AuthContext";
-import { loginWithPasswordHash, type LoginApiError } from "./authApi";
 import { loginServerApi } from "../api/serverApi";
-import { saveServerApiToken } from "../api/serverToken";
 import { Toaster } from "../components/ui/sonner";
-import { toast } from "sonner";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
@@ -14,22 +11,8 @@ import { CandlestickBrandIcon } from "../components/BrandMark";
 import { cn } from "../components/ui/utils";
 import "./login-page.css";
 
-/** 会话有效期（SaaS：仅当前浏览器会话，关闭标签或过期后需重新登录） */
+/** 会话有效期（与数据服务 Token 一致：8 小时） */
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
-
-function mapLoginError(e: LoginApiError): string {
-  switch (e) {
-    case "ACCOUNT_NOT_FOUND":
-    case "WRONG_PASSWORD":
-      return "用户名或密码错误";
-    case "TIMEOUT":
-      return "请求超时，请稍后重试";
-    case "ABORTED":
-      return "请求已取消";
-    default:
-      return "登录失败，请重试";
-  }
-}
 
 export default function LoginPage() {
   const { token, ready, login } = useAuth();
@@ -39,7 +22,6 @@ export default function LoginPage() {
 
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [touched, setTouched] = useState({ user: false, pass: false });
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
@@ -69,21 +51,6 @@ export default function LoginPage() {
     return () => timers.forEach(clearTimeout);
   }, [ready, token, syncAutofillFromDom]);
 
-  const userError = useMemo(() => {
-    const u = username.trim();
-    if (!touched.user) return null;
-    if (u.length === 0) return "请输入用户名";
-    if (u.length < 2) return "用户名至少 2 个字符";
-    return null;
-  }, [username, touched.user]);
-
-  const passError = useMemo(() => {
-    if (!touched.pass) return null;
-    if (password.length === 0) return "请输入密码";
-    if (password.length < 6) return "密码至少 6 位";
-    return null;
-  }, [password, touched.pass]);
-
   function clearLoginError() {
     setLoginError(null);
   }
@@ -108,9 +75,17 @@ export default function LoginPage() {
     const usernameTrim = uRaw.trim();
     setUsername(uRaw);
     setPassword(pRaw);
-    setTouched({ user: true, pass: true });
 
-    if (usernameTrim.length < 2 || pRaw.length < 6) {
+    if (usernameTrim.length === 0 && pRaw.length === 0) {
+      setLoginError("请输入用户名和密码");
+      return;
+    }
+    if (usernameTrim.length === 0) {
+      setLoginError("请输入用户名");
+      return;
+    }
+    if (pRaw.length === 0) {
+      setLoginError("请输入密码");
       return;
     }
 
@@ -121,35 +96,37 @@ export default function LoginPage() {
     abortRef.current = new AbortController();
 
     try {
-      const res = await loginWithPasswordHash({
-        username: usernameTrim,
-        passwordPlain: pRaw,
-        signal: abortRef.current.signal,
-      });
+      const serverRes = await loginServerApi(usernameTrim, pRaw, abortRef.current.signal);
 
-      if (!res.ok) {
-        setLoginError(mapLoginError(res.error));
+      if (!serverRes.ok) {
+        setLoginError(serverRes.message);
         return;
       }
 
-      const serverRes = await loginServerApi(usernameTrim, pRaw, abortRef.current.signal);
-
       const expiresAtMs = Date.now() + SESSION_TTL_MS;
-      /** 必须先 login（saveSession 会 clearAllAuthStorage 含 clearServerApiToken），再写入数据服务 Token */
       login({
-        token: res.token,
+        token: serverRes.token,
         expiresAtMs,
         username: usernameTrim,
         rememberMe: false,
         autoLogin: false,
+        profile: {
+          username: serverRes.user.username,
+          displayName: serverRes.user.displayName,
+          role: serverRes.user.role,
+          forcePasswordChange: serverRes.user.forcePasswordChange,
+        },
       });
-      if (serverRes.ok) {
-        saveServerApiToken(serverRes.token);
-      } else {
-        saveServerApiToken(null);
-        toast.warning(`数据服务未连接：${serverRes.message}。导入将仅在浏览器本地解析 Excel。`);
-      }
       navigate(from, { replace: true });
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      if (/failed to fetch|network|fetch|load failed|connrefused/i.test(raw)) {
+        setLoginError(
+          "无法连接数据服务。请在项目根目录执行 npm run dev:all，或另开终端进入 server 目录执行 npm run dev（监听 8787）。",
+        );
+      } else {
+        setLoginError(raw || "网络异常");
+      }
     } finally {
       setLoading(false);
       submitLock.current = false;
@@ -274,16 +251,11 @@ export default function LoginPage() {
                   value={username}
                   onChange={handleUsernameInput}
                   onInput={handleUsernameInput}
-                  onBlur={() => setTouched((t) => ({ ...t, user: true }))}
                   placeholder="请输入用户名"
                   disabled={loading}
-                  aria-invalid={!!userError}
-                  className={cn(fieldClass, userError && "ring-2 ring-destructive/30")}
+                  className={fieldClass}
                 />
               </div>
-              {userError && (
-                <p className="w-full text-left text-[13px] leading-relaxed text-destructive">{userError}</p>
-              )}
             </div>
 
             <div className="flex flex-col gap-2 self-stretch pb-6">
@@ -310,15 +282,9 @@ export default function LoginPage() {
                   value={password}
                   onChange={handlePasswordInput}
                   onInput={handlePasswordInput}
-                  onBlur={() => setTouched((t) => ({ ...t, pass: true }))}
                   placeholder="请输入密码"
                   disabled={loading}
-                  aria-invalid={!!passError}
-                  className={cn(
-                    fieldClass,
-                    "pr-12",
-                    passError && "ring-2 ring-destructive/30",
-                  )}
+                  className={cn(fieldClass, "pr-12")}
                 />
                 <button
                   type="button"
@@ -335,9 +301,6 @@ export default function LoginPage() {
                   )}
                 </button>
               </div>
-              {passError && (
-                <p className="text-[13px] leading-relaxed text-destructive">{passError}</p>
-              )}
             </div>
 
             <Button
@@ -345,7 +308,7 @@ export default function LoginPage() {
               variant="default"
               disabled={loading}
               className={cn(
-                "relative h-auto min-h-[52px] w-full gap-2 rounded-lg border-0 !bg-[linear-gradient(170deg,var(--primary)_0%,var(--primary-gradient-end)_100%)] px-0 py-3.5 font-['Manrope',sans-serif] text-[15px] font-bold leading-snug !text-primary-foreground shadow-[0px_2px_4px_-2px_rgba(0,0,0,0.1),0px_4px_6px_-1px_rgba(0,0,0,0.1)] hover:!opacity-[0.97] disabled:!opacity-50",
+                "relative h-auto min-h-[52px] w-full cursor-pointer gap-2 rounded-lg border-0 !bg-[linear-gradient(170deg,var(--primary)_0%,var(--primary-gradient-end)_100%)] px-0 py-3.5 font-['Manrope',sans-serif] text-[15px] font-bold leading-snug !text-primary-foreground shadow-[0px_2px_4px_-2px_rgba(0,0,0,0.1),0px_4px_6px_-1px_rgba(0,0,0,0.1)] hover:!opacity-[0.97] disabled:!opacity-50 disabled:cursor-not-allowed",
               )}
             >
               {loading ? (
@@ -365,32 +328,20 @@ export default function LoginPage() {
         </div>
 
         <footer className="relative flex shrink-0 flex-col items-center gap-4 self-stretch px-8 py-6 sm:py-8">
-          <nav
+          <div
             className="flex flex-row flex-wrap items-center justify-center gap-x-8 gap-y-2"
-            aria-label="页脚链接"
+            aria-label="页脚说明"
           >
-            <a
-              href="#"
-              className="font-['Inter',sans-serif] text-[13px] font-normal uppercase leading-[1.38] tracking-[0.02em] text-[#64748B] opacity-85 hover:opacity-100"
-              onClick={(e) => e.preventDefault()}
-            >
+            <span className="cursor-default select-none font-['Inter',sans-serif] text-[13px] font-normal uppercase leading-[1.38] tracking-[0.02em] text-[#64748B] opacity-85">
               隐私政策
-            </a>
-            <a
-              href="#"
-              className="font-['Inter',sans-serif] text-[13px] font-normal uppercase leading-[1.38] tracking-[0.02em] text-[#64748B] opacity-85 hover:opacity-100"
-              onClick={(e) => e.preventDefault()}
-            >
+            </span>
+            <span className="cursor-default select-none font-['Inter',sans-serif] text-[13px] font-normal uppercase leading-[1.38] tracking-[0.02em] text-[#64748B] opacity-85">
               服务条款
-            </a>
-            <a
-              href="#"
-              className="font-['Inter',sans-serif] text-[13px] font-normal uppercase leading-[1.38] tracking-[0.02em] text-[#64748B] opacity-85 hover:opacity-100"
-              onClick={(e) => e.preventDefault()}
-            >
+            </span>
+            <span className="cursor-default select-none font-['Inter',sans-serif] text-[13px] font-normal uppercase leading-[1.38] tracking-[0.02em] text-[#64748B] opacity-85">
               安全架构
-            </a>
-          </nav>
+            </span>
+          </div>
           <p className="text-center font-['Inter',sans-serif] text-[13px] font-semibold leading-[1.5] text-[#64748B]">
             © {year} Quantitative Analysis · 仅供研究与学习使用
           </p>

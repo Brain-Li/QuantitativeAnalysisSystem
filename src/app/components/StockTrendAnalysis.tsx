@@ -1,4 +1,12 @@
-import { useState, useMemo, useRef, useEffect, type CSSProperties } from 'react';
+import {
+  useState,
+  useMemo,
+  useRef,
+  useEffect,
+  useDeferredValue,
+  type CSSProperties,
+  type MouseEvent,
+} from 'react';
 import {
   LineChart,
   Line,
@@ -25,9 +33,17 @@ import {
   Search,
   Check,
   Trash2,
+  Loader2,
 } from 'lucide-react';
 import { Card, CardContent, CardTitle } from './ui/card';
 import { Button } from './ui/button';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from './ui/select';
 import { VirtualStockList } from './VirtualStockList';
 import { Label } from './ui/label';
 import { Switch } from './ui/switch';
@@ -35,9 +51,21 @@ import {
   DateRangePickerButton,
   type DateRange,
   getLast7DaysRange,
+  normalizeDateRangeForApply,
   detectDateField,
 } from './DateRangePickerButton';
 import type { StockData } from '../types';
+import {
+  STORAGE_KEY_LEGACY_TREND_DATE,
+  STORAGE_KEY_TREND_STATE,
+} from '../sessionPersistence';
+import { toast } from 'sonner';
+import {
+  fetchDistinctCodesApi,
+  queryMergedRowsApi,
+  fetchAllMergedRowsForFilters,
+} from '../api/serverApi';
+import { streamLocalIdbForDataTable } from '../api/localDatasetIdb';
 import { TrendChartTooltip } from './TrendChartTooltip';
 import {
   formatDateCell,
@@ -52,6 +80,10 @@ import {
 interface StockTrendAnalysisProps {
   data: StockData[];
   allFields: string[];
+  /** 与 DataTable 一致：已登录数据服务且选中数据集时按需拉取合并行 */
+  serverDatasetIds?: string[];
+  /** 未登录：选中项含 IndexedDB 大表时从本地合并加载 */
+  localIdbDatasetIds?: string[];
 }
 
 type TrendViewMode = 'single' | 'dual';
@@ -82,9 +114,27 @@ const CHART_COLORS = ['#155DFC', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#e
 /** 趋势图绘图区高度（px）；单指标 / 双指标共用 */
 const TREND_CHART_HEIGHT = 440;
 
-/** 趋势分析完整 UI 状态（时间、股票、指标、对比图），切换菜单后恢复 */
-const STORAGE_KEY_TREND_STATE = 'trend_analysis_state_v1';
-const LEGACY_TREND_DATE_KEY = 'trend_analysis_date_range_v1';
+/** 数据标签字号（与下方 SVG text 一致） */
+const DATA_LABEL_FONT_PX = 14;
+/** 柱图：正值在柱顶上方；负值柱底标签与柱端间距（略大于柱顶，避免贴底） */
+const BAR_LABEL_GAP_ABOVE = 12;
+const BAR_LABEL_GAP_BELOW = 16;
+/** 底部方案：基线以下数字占位 + 横轴刻度带（近似 px） */
+const BAR_LABEL_BOTTOM_FOOTPRINT = 32;
+/** 负值改柱侧时与柱的水平间距 */
+const BAR_LABEL_SIDE_GAP = 6;
+/** 侧放时与绘图区左缘保留宽度，避免压纵轴刻度（近似） */
+const BAR_LABEL_Y_AXIS_CLEARANCE = 46;
+/** 侧放标签估算宽度（短数字，px；用于与纵轴/右缘碰撞判断） */
+const BAR_LABEL_SIDE_TEXT_WIDTH = 40;
+/** 折线：相对数据点的纵向偏移（外侧，避免压线） */
+const LINE_LABEL_DY_ABOVE = -17;
+const LINE_LABEL_DY_BELOW = 19;
+/** 折线：点过密时抽样展示，减少互相遮挡 */
+const LINE_LABEL_DENSE_MIN_ROWS = 36;
+const LINE_LABEL_MAX_SHOWN = 24;
+/** 折线标签近似绘图区纵向范围（ResponsiveContainer 内扣 margin，用于贴边翻转） */
+const LINE_LABEL_APPROX_Y_MAX = 292;
 
 interface TrendPersistV1 {
   v: 1;
@@ -186,7 +236,7 @@ function loadTrendPersist(): TrendPersistV1 | null {
         additionalCharts,
       };
     }
-    const legacy = localStorage.getItem(LEGACY_TREND_DATE_KEY);
+    const legacy = localStorage.getItem(STORAGE_KEY_LEGACY_TREND_DATE);
     if (legacy) {
       const parsed = JSON.parse(legacy) as unknown;
       if (parsed && typeof parsed === 'object') {
@@ -218,12 +268,6 @@ function getDefaultTrendDateRange(): DateRange {
   return getLast7DaysRange();
 }
 
-function dateRangeLabelText(start: string, end: string): string {
-  if (!start && !end) return '选择时间';
-  if (start === end) return start || '选择时间';
-  return `${start || '—'} 至 ${end || '—'}`;
-}
-
 /** 与股票列表同款 `DateRangePickerButton`；用于对比图卡片的独立日期 */
 function StandaloneDateRangePicker({
   dateFrom,
@@ -248,15 +292,12 @@ function StandaloneDateRangePicker({
     }
   }, [open, dateFrom, dateTo]);
 
-  const label = useMemo(
-    () => dateRangeLabelText(dateFrom, dateTo),
-    [dateFrom, dateTo]
-  );
-
   const apply = (range?: DateRange) => {
-    let { start, end } = range ?? tempRange;
-    if (start && end && start > end) [start, end] = [end, start];
-    onDateChange(start, end);
+    const n = normalizeDateRangeForApply(range ?? tempRange, {
+      emptyToLast7: true,
+      emptyDefaultRange: getLast7DaysRange,
+    });
+    onDateChange(n.start, n.end);
     setOpen(false);
   };
 
@@ -267,7 +308,7 @@ function StandaloneDateRangePicker({
 
   return (
     <DateRangePickerButton
-      label={label}
+      appliedRange={{ start: dateFrom, end: dateTo }}
       open={open}
       onOpenChange={(v) => {
         setOpen(v);
@@ -279,6 +320,7 @@ function StandaloneDateRangePicker({
       onClear={clear}
       hasDateField={hasDateField}
       hasFilter={!!(dateFrom || dateTo)}
+      emptyDefaultRange={getLast7DaysRange}
     />
   );
 }
@@ -289,17 +331,21 @@ function StockSelector({
   selected,
   onChange,
   isSingleSelect = false,
+  optionsLoading = false,
 }: {
   options: StockOption[];
   selected: string[];
   onChange: (stocks: string[]) => void;
   isSingleSelect?: boolean;
+  /** 服务端拉取股票代码列表期间为 true */
+  optionsLoading?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const ref = useRef<HTMLDivElement>(null);
 
   const selectedSet = useMemo(() => new Set(selected), [selected]);
+  const deferredQuery = useDeferredValue(query);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -319,12 +365,12 @@ function StockSelector({
   }, [open]);
 
   const filtered = useMemo(() => {
-    if (!query) return options;
-    const q = query.toLowerCase();
+    if (!deferredQuery) return options;
+    const q = deferredQuery.toLowerCase();
     return options.filter(
       (s) => s.code.toLowerCase().includes(q) || s.name.toLowerCase().includes(q)
     );
-  }, [options, query]);
+  }, [options, deferredQuery]);
 
   const toggle = (code: string) => {
     if (isSingleSelect) {
@@ -344,6 +390,7 @@ function StockSelector({
   };
 
   const buttonLabel = () => {
+    if (optionsLoading && options.length === 0) return '加载股票列表…';
     if (selected.length === 0) return '选择股票';
     if (selected.length === 1) {
       const stock = options.find((s) => s.code === selected[0]);
@@ -360,6 +407,9 @@ function StockSelector({
         className={`gap-2 ${selected.length > 0 ? 'border-primary/50 text-primary' : ''}`}
         onClick={() => setOpen(!open)}
       >
+        {optionsLoading && options.length === 0 ? (
+          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" aria-hidden />
+        ) : null}
         <span className="text-sm leading-snug">{buttonLabel()}</span>
         {selected.length > 0 && (
           <span
@@ -399,8 +449,17 @@ function StockSelector({
 
           {options.length === 0 ? (
             <div className="py-8 text-center text-sm text-muted-foreground">
-              数据中未识别到股票字段
-              <p className="text-sm mt-1 text-muted-foreground/70">请确认数据包含代码或名称列</p>
+              {optionsLoading ? (
+                <>
+                  <Loader2 className="h-8 w-8 mx-auto mb-2 animate-spin opacity-40" aria-hidden />
+                  <p>正在加载股票列表…</p>
+                </>
+              ) : (
+                <>
+                  数据中未识别到股票字段
+                  <p className="text-sm mt-1 text-muted-foreground/70">请确认数据包含代码或名称列</p>
+                </>
+              )}
             </div>
           ) : filtered.length === 0 ? (
             <div className="py-6 text-center text-sm text-muted-foreground">未找到匹配股票</div>
@@ -607,68 +666,172 @@ function DualAxisSeriesTypeToggle({
   );
 }
 
-type TrendValueLabelOpts =
-  | { kind: 'line' }
-  | {
-      kind: 'bar';
-      /** 单指标：柱顶水平居中；双指标：先避免被邻柱遮挡，再略偏左/右 */
-      barLabelPriority: 'single' | 'dual';
-      /** 双柱并排时仅用于水平微调，减轻后绘制的柱盖住先绘制的标签 */
-      dualBarSide?: 'left' | 'right';
-    };
+type BarLabelOpts = {
+  /** 单指标：柱顶水平居中；双指标：略偏左/右减轻并排遮挡 */
+  barLabelPriority: 'single' | 'dual';
+  dualBarSide?: 'left' | 'right';
+  /** 与折线同图时，柱标签略作纵向错开，减轻与折线点标签重叠 */
+  composedWithLine?: boolean;
+  /** 用于相邻负值柱错开顶/底策略（与 dataKey 成对） */
+  rows?: StockData[];
+  dataKey?: string;
+};
 
-/** 由 Bar 矩形几何计算标签位置：柱顶中点上方（负柱取矩形靠上的一边） */
-function barLabelPositionFromViewBox(
-  viewBox: { x: number; y: number; width: number; height: number },
-  opts: Extract<TrendValueLabelOpts, { kind: 'bar' }>
-): { cx: number; textY: number } {
-  const { x, y, width, height } = viewBox;
-  const topY = Math.min(y, y + height);
-  /** 柱顶边到数字基线的距离（px）；14px 字用 hanging+小 gap 会把字形下半压在柱顶，故改为基线对齐并留足空隙 */
-  const baselineClearance = opts.barLabelPriority === 'dual' ? 16 : 14;
-  let cx = x + width / 2;
-  if (opts.barLabelPriority === 'dual') {
-    const nudge = opts.dualBarSide === 'left' ? -7 : opts.dualBarSide === 'right' ? 7 : 0;
-    cx += nudge;
-  }
-  const textY = topY - baselineClearance;
-  return { cx, textY };
+function parseRowMetric(row: StockData | undefined, key: string): number | null {
+  if (!row) return null;
+  const raw = row[key];
+  if (raw === null || raw === undefined || raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseLabelNumber(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+type BarLabelLayout =
+  | { mode: 'above'; cx: number; textY: number }
+  | { mode: 'below'; cx: number; textY: number }
+  /** 负值：零轴上方（柱顶沿之上），水平居中 */
+  | { mode: 'aboveNegative'; cx: number; textY: number }
+  /** 负值：柱左侧或右侧，靠近柱底纵向位置 */
+  | { mode: 'side'; x: number; textY: number; anchor: 'start' | 'end' };
+
+/** textAnchor=end 时锚点在数字右端，文字向左延伸 */
+function sideLabelWouldClipYAxisLeft(
+  parentVB: { x: number; y: number; width: number; height: number },
+  anchorX: number
+): boolean {
+  const leftmost = anchorX - BAR_LABEL_SIDE_TEXT_WIDTH;
+  return leftmost < parentVB.x + BAR_LABEL_Y_AXIS_CLEARANCE;
+}
+
+/** textAnchor=start 时锚点在数字左端，文字向右延伸 */
+function sideLabelWouldClipPlotRight(
+  parentVB: { x: number; y: number; width: number; height: number },
+  anchorX: number
+): boolean {
+  const rightmost = anchorX + BAR_LABEL_SIDE_TEXT_WIDTH;
+  return rightmost > parentVB.x + parentVB.width - 6;
 }
 
 /**
- * Recharts LabelList 自定义内容：14px。
- * 折线：沿用数据点坐标；柱图：必须用 `viewBox`（柱矩形）算柱顶水平居中，勿仅用 x/y（否则为左上角，会偏左且负柱易与柱体重叠）。
+ * 负值柱标签：1）底部不与横轴冲突则底居中；2）否则尝试柱侧（双柱仅外侧重叠 Y 轴则顶放）；3）两侧均不可用则顶放。
  */
-function trendValueLabelContent(metric: string, seriesColor: string, opts: TrendValueLabelOpts = { kind: 'line' }) {
+function computeBarLabelLayout(
+  viewBox: { x: number; y: number; width: number; height: number },
+  opts: BarLabelOpts,
+  numericValue: number,
+  props: Record<string, unknown>
+): BarLabelLayout {
+  const { x, y, width, height } = viewBox;
+  const topY = Math.min(y, y + height);
+  const bottomY = Math.max(y, y + height);
+  const cxBase = x + width / 2;
+  let cx = cxBase;
+  if (opts.barLabelPriority === 'dual') {
+    cx += opts.dualBarSide === 'left' ? -7 : opts.dualBarSide === 'right' ? 7 : 0;
+  }
+
+  const indexRaw = props.index;
+  const index = typeof indexRaw === 'number' ? indexRaw : Number.parseInt(String(indexRaw ?? 0), 10);
+
+  const barH = Math.abs(height);
+  const microY = opts.composedWithLine ? (index % 3) * 2 - 2 : 0;
+
+  if (numericValue >= 0) {
+    let textY = topY - BAR_LABEL_GAP_ABOVE + microY;
+    if (topY < 20) {
+      textY = Math.min(bottomY - 4, topY + Math.max(10, barH * 0.35)) + microY;
+    }
+    return { mode: 'above', cx, textY };
+  }
+
+  const parentVB = props.parentViewBox as
+    | { x?: number; y?: number; width?: number; height?: number }
+    | undefined;
+
+  let plotBottom: number | undefined;
+  if (parentVB && parentVB.y !== undefined && parentVB.height !== undefined) {
+    plotBottom = parentVB.y + parentVB.height;
+  }
+
+  const bottomBaselineY = bottomY + BAR_LABEL_GAP_BELOW + microY;
+  const bottomFitsVertically =
+    plotBottom === undefined ||
+    bottomBaselineY + BAR_LABEL_BOTTOM_FOOTPRINT <= plotBottom;
+
+  const aboveNegativeY = topY - BAR_LABEL_GAP_ABOVE + microY;
+
+  /** 侧放纵向：靠近柱体下半段，略上移避免贴底 */
+  const sideTextY =
+    Math.max(
+      topY + DATA_LABEL_FONT_PX + 2,
+      Math.min(bottomY - 8, topY + Math.max(barH * 0.62, 20)),
+    ) + microY;
+
+  const rows = opts.rows;
+  const dataKey = opts.dataKey;
+
+  if (bottomFitsVertically) {
+    return { mode: 'below', cx, textY: bottomBaselineY };
+  }
+
+  if (!parentVB || parentVB.x === undefined || parentVB.width === undefined) {
+    return { mode: 'aboveNegative', cx, textY: aboveNegativeY };
+  }
+
+  const vbFull = {
+    x: parentVB.x,
+    y: parentVB.y ?? 0,
+    width: parentVB.width,
+    height: parentVB.height ?? 0,
+  };
+
+  const isDual = opts.barLabelPriority === 'dual';
+
+  const trySideLeft = (): BarLabelLayout | null => {
+    const ax = x - BAR_LABEL_SIDE_GAP;
+    if (sideLabelWouldClipYAxisLeft(vbFull, ax)) return null;
+    return { mode: 'side', x: ax, textY: sideTextY, anchor: 'end' as const };
+  };
+
+  const trySideRight = (): BarLabelLayout | null => {
+    const ax = x + width + BAR_LABEL_SIDE_GAP;
+    if (sideLabelWouldClipPlotRight(vbFull, ax)) return null;
+    return { mode: 'side', x: ax, textY: sideTextY, anchor: 'start' as const };
+  };
+
+  if (isDual) {
+    if (opts.dualBarSide === 'left') {
+      const left = trySideLeft();
+      if (left) return left;
+      return { mode: 'aboveNegative', cx, textY: aboveNegativeY };
+    }
+    const right = trySideRight();
+    if (right) return right;
+    return { mode: 'aboveNegative', cx, textY: aboveNegativeY };
+  }
+
+  const preferLeftFirst = index % 2 === 0;
+  const first = preferLeftFirst ? trySideLeft() : trySideRight();
+  if (first) return first;
+  const second = preferLeftFirst ? trySideRight() : trySideLeft();
+  if (second) return second;
+
+  return { mode: 'aboveNegative', cx, textY: aboveNegativeY };
+}
+
+/** 柱状图数据标签（单指标 / 双柱） */
+function trendBarLabelContent(metric: string, seriesColor: string, opts: BarLabelOpts) {
   return (props: Record<string, unknown>) => {
     const value = props.value;
     if (value === undefined || value === null) return null;
     const txt = formatMetricValueForChart(metric, value);
     const zf = isZhangDieFuField(metric) ? zhangDieFuStyle(value) : undefined;
     const fill = zf?.color ?? seriesColor;
-
-    if (opts.kind === 'line') {
-      const x = props.x;
-      const y = props.y;
-      if (x === undefined || y === undefined) return null;
-      const nx = typeof x === 'number' ? x : Number.parseFloat(String(x));
-      const ny = typeof y === 'number' ? y : Number.parseFloat(String(y));
-      if (!Number.isFinite(nx) || !Number.isFinite(ny)) return null;
-      return (
-        <text
-          x={nx}
-          y={ny}
-          dy={-12}
-          textAnchor="middle"
-          fontSize={14}
-          fill={fill}
-          className="select-none"
-          style={{ pointerEvents: 'none' }}
-        >
-          {txt}
-        </text>
-      );
-    }
 
     const vb = props.viewBox as { x?: number; y?: number; width?: number; height?: number } | undefined;
     if (
@@ -680,21 +843,144 @@ function trendValueLabelContent(metric: string, seriesColor: string, opts: Trend
     ) {
       return null;
     }
-    const { cx, textY } = barLabelPositionFromViewBox(
-      {
-        x: vb.x,
-        y: vb.y,
-        width: vb.width,
-        height: vb.height,
-      },
-      opts
+
+    const num = parseLabelNumber(value);
+    if (num === null) return null;
+
+    const layout = computeBarLabelLayout(
+      { x: vb.x, y: vb.y, width: vb.width, height: vb.height },
+      opts,
+      num,
+      props
     );
+
+    if (layout.mode === 'side') {
+      return (
+        <text
+          x={layout.x}
+          y={layout.textY}
+          textAnchor={layout.anchor}
+          fontSize={DATA_LABEL_FONT_PX}
+          fill={fill}
+          className="select-none"
+          style={{ pointerEvents: 'none' }}
+        >
+          {txt}
+        </text>
+      );
+    }
+
+    const cx = layout.cx;
+    const textY = layout.textY;
     return (
       <text
         x={cx}
         y={textY}
         textAnchor="middle"
-        fontSize={14}
+        fontSize={DATA_LABEL_FONT_PX}
+        fill={fill}
+        className="select-none"
+        style={{ pointerEvents: 'none' }}
+      >
+        {txt}
+      </text>
+    );
+  };
+}
+
+/**
+ * 折线数据标签 PRD：优先在数据点外侧（上/下），避免压线；点过密时抽样；双轴时左右错开减轻重叠。
+ */
+function trendLineLabelContent(
+  metric: string,
+  seriesColor: string,
+  rows: StockData[],
+  dataKey: string,
+  opts?: {
+    dualSlot?: 'left' | 'right';
+    seriesStackIndex?: number;
+    /** 与同图柱序列并存时略偏移，减轻与柱标签/柱体重叠 */
+    composedWithBar?: boolean;
+  }
+) {
+  return (props: Record<string, unknown>) => {
+    const value = props.value;
+    if (value === undefined || value === null) return null;
+    const txt = formatMetricValueForChart(metric, value);
+    const zf = isZhangDieFuField(metric) ? zhangDieFuStyle(value) : undefined;
+    const fill = zf?.color ?? seriesColor;
+
+    const x = props.x;
+    const y = props.y;
+    if (x === undefined || y === undefined) return null;
+    const nx = typeof x === 'number' ? x : Number.parseFloat(String(x));
+    const ny = typeof y === 'number' ? y : Number.parseFloat(String(y));
+    if (!Number.isFinite(nx) || !Number.isFinite(ny)) return null;
+
+    const indexRaw = props.index;
+    const index = typeof indexRaw === 'number' ? indexRaw : Number.parseInt(String(indexRaw ?? 0), 10);
+    const n = rows.length;
+    if (n === 0 || index < 0 || index >= n) return null;
+
+    let stride = 1;
+    if (n >= LINE_LABEL_DENSE_MIN_ROWS) {
+      stride = Math.max(1, Math.ceil(n / LINE_LABEL_MAX_SHOWN));
+    }
+    if (stride > 1 && index % stride !== 0) return null;
+
+    const v = parseRowMetric(rows[index], dataKey);
+    if (v === null) return null;
+    const vPrev = parseRowMetric(rows[index > 0 ? index - 1 : index], dataKey);
+    const vNext = parseRowMetric(rows[index < n - 1 ? index + 1 : index], dataKey);
+    const vp = vPrev ?? v;
+    const vn = vNext ?? v;
+
+    let dy: number;
+    if (index === 0) {
+      dy = v >= vn ? LINE_LABEL_DY_ABOVE : LINE_LABEL_DY_BELOW;
+    } else if (index === n - 1) {
+      dy = v >= vp ? LINE_LABEL_DY_ABOVE : LINE_LABEL_DY_BELOW;
+    } else if (v >= vp && v >= vn) {
+      dy = LINE_LABEL_DY_ABOVE;
+    } else if (v <= vp && v <= vn) {
+      dy = LINE_LABEL_DY_BELOW;
+    } else {
+      const mid = (vp + vn) / 2;
+      dy = v >= mid ? LINE_LABEL_DY_ABOVE : LINE_LABEL_DY_BELOW;
+    }
+
+    /** 仍偏密时微错开纵向，减轻相邻点标签互相遮挡 */
+    if (stride === 1 && n > 28) {
+      dy += ((index % 3) - 1) * 5;
+    }
+
+    /** 贴绘图区上下沿时翻转，减轻与图例区/横轴区重叠（近似坐标） */
+    if (ny < 22 && dy < 0) dy = LINE_LABEL_DY_BELOW;
+    if (ny > LINE_LABEL_APPROX_Y_MAX - 18 && dy > 0) dy = LINE_LABEL_DY_ABOVE;
+
+    let dx = 0;
+    if (opts?.dualSlot === 'left') dx = -6;
+    if (opts?.dualSlot === 'right') dx = 6;
+    if (opts?.seriesStackIndex !== undefined) {
+      dx += (opts.seriesStackIndex % 3) * 4 - 4;
+    }
+    if (stride === 1 && n > 40) {
+      dx += ((index % 2) * 2 - 1) * 3;
+    }
+
+    if (opts?.composedWithBar) {
+      if (dy < 0) dy -= 5;
+      else if (dy > 0) dy += 5;
+      dx += opts.dualSlot === 'left' ? -3 : opts.dualSlot === 'right' ? 3 : 0;
+    }
+
+    return (
+      <text
+        x={nx + dx}
+        y={ny}
+        dy={dy}
+        textAnchor="middle"
+        fontSize={DATA_LABEL_FONT_PX}
         fill={fill}
         className="select-none"
         style={{ pointerEvents: 'none' }}
@@ -736,6 +1022,16 @@ function ChartRenderer({
   stockCode: string;
   showDataLabels?: boolean;
 }) {
+  /** 双指标：图例点击切换左/右序列显示（与 Recharts Line/Bar 的 hide 联动） */
+  const [dualLegendHidden, setDualLegendHidden] = useState({ left: false, right: false });
+
+  useEffect(() => {
+    setDualLegendHidden({ left: false, right: false });
+  }, [leftMetric, rightMetric]);
+
+  /** 单指标：按 dataKey（指标字段名）记录图例隐藏 */
+  const [singleLegendHidden, setSingleLegendHidden] = useState<Record<string, boolean>>({});
+
   const formatDate = (value: string | number | Date) => {
     const str = String(value);
     if (str.includes(' ')) return str.split(' ')[0];
@@ -764,6 +1060,10 @@ function ChartRenderer({
   const yAxisMetric = displayMetrics[0] ?? metrics[0] ?? '';
   const showMetricTabs =
     !isDual && metrics.length > 1 && activeMetric !== undefined;
+
+  useEffect(() => {
+    setSingleLegendHidden({});
+  }, [metrics.join(','), activeMetric ?? '', type]);
   const yDomain = useMemo(
     () => (yAxisMetric ? computeTrendYAxisDomain(formattedData, yAxisMetric, stockCode) : undefined),
     [formattedData, yAxisMetric, stockCode]
@@ -800,12 +1100,11 @@ function ChartRenderer({
     );
   }
 
-  const labelExtraTop = showDataLabels ? 26 : 0;
   const commonProps = {
     data: formattedData,
     margin: {
       /* 上边距：为图例与绘图区间留出空隙；双轴左/右标题与刻度需左右留白，避免裁切与重叠 */
-      top: (isDual ? 64 : showMetricTabs ? 106 : 74) + labelExtraTop,
+      top: isDual ? 64 : showMetricTabs ? 106 : 74,
       right: isDual ? 56 : 16,
       /* 双轴：轴标题用 outside（left/right），需更大 margin，避免与刻度数字重叠 */
       left: isDual ? 72 : 14,
@@ -830,6 +1129,33 @@ function ChartRenderer({
     marginTop: -8,
     paddingTop: 0,
     paddingBottom: 16,
+  };
+
+  const handleDualLegendClick = (
+    data: { dataKey?: unknown },
+    _index: number,
+    e: MouseEvent
+  ) => {
+    e.preventDefault();
+    const k = data.dataKey;
+    if (typeof k !== 'string') return;
+    if (k === leftMetric) {
+      setDualLegendHidden((s) => ({ ...s, left: !s.left }));
+    } else if (k === rightMetric) {
+      setDualLegendHidden((s) => ({ ...s, right: !s.right }));
+    }
+  };
+
+  const handleSingleLegendClick = (
+    data: { dataKey?: unknown },
+    _index: number,
+    e: MouseEvent
+  ) => {
+    e.preventDefault();
+    const k = data.dataKey;
+    if (typeof k !== 'string') return;
+    if (!displayMetrics.includes(k)) return;
+    setSingleLegendHidden((prev) => ({ ...prev, [k]: !prev[k] }));
   };
 
   if (isDual && leftMetric && rightMetric) {
@@ -883,10 +1209,12 @@ function ChartRenderer({
               )}
             <Tooltip content={<TrendChartTooltip />} />
             <Legend
-              wrapperStyle={legendWrapperStyle}
+              wrapperStyle={{ ...legendWrapperStyle, cursor: 'pointer' }}
               verticalAlign="top"
               align="center"
-              iconType={leftSeriesKind === 'line' && rightSeriesKind === 'line' ? 'line' : 'rect'}
+              iconType="circle"
+              iconSize={10}
+              onClick={handleDualLegendClick}
             />
             {leftSeriesKind === 'line' ? (
               <Line
@@ -894,18 +1222,32 @@ function ChartRenderer({
                 type="monotone"
                 dataKey={leftMetric}
                 name={getFieldDisplayHeader(leftMetric)}
+                hide={dualLegendHidden.left}
                 stroke={CHART_COLORS[leftColorIdx % CHART_COLORS.length]}
                 strokeWidth={2}
-                dot={{ r: 3, strokeWidth: 0 }}
-                activeDot={{ r: 5 }}
+                dot={{
+                  r: 3,
+                  fill: CHART_COLORS[leftColorIdx % CHART_COLORS.length],
+                  strokeWidth: 0,
+                }}
+                activeDot={{
+                  r: 5,
+                  fill: CHART_COLORS[leftColorIdx % CHART_COLORS.length],
+                  strokeWidth: 0,
+                }}
               >
                 {showDataLabels && (
                   <LabelList
                     dataKey={leftMetric}
-                    content={trendValueLabelContent(
+                    content={trendLineLabelContent(
                       leftMetric,
                       CHART_COLORS[leftColorIdx % CHART_COLORS.length],
-                      { kind: 'line' }
+                      formattedData,
+                      leftMetric,
+                      {
+                        dualSlot: 'left',
+                        composedWithBar: rightSeriesKind === 'bar',
+                      }
                     )}
                   />
                 )}
@@ -915,6 +1257,7 @@ function ChartRenderer({
                 yAxisId="left"
                 dataKey={leftMetric}
                 name={getFieldDisplayHeader(leftMetric)}
+                hide={dualLegendHidden.left}
                 fill={CHART_COLORS[leftColorIdx % CHART_COLORS.length]}
                 radius={[2, 2, 0, 0]}
                 barSize={18}
@@ -922,10 +1265,16 @@ function ChartRenderer({
                 {showDataLabels && (
                   <LabelList
                     dataKey={leftMetric}
-                    content={trendValueLabelContent(
+                    content={trendBarLabelContent(
                       leftMetric,
                       CHART_COLORS[leftColorIdx % CHART_COLORS.length],
-                      { kind: 'bar', barLabelPriority: 'dual', dualBarSide: 'left' }
+                      {
+                        barLabelPriority: 'dual',
+                        dualBarSide: 'left',
+                        composedWithLine: rightSeriesKind === 'line',
+                        rows: formattedData,
+                        dataKey: leftMetric,
+                      }
                     )}
                   />
                 )}
@@ -937,18 +1286,32 @@ function ChartRenderer({
                 type="monotone"
                 dataKey={rightMetric}
                 name={getFieldDisplayHeader(rightMetric)}
+                hide={dualLegendHidden.right}
                 stroke={CHART_COLORS[rightColorIdx % CHART_COLORS.length]}
                 strokeWidth={2}
-                dot={{ r: 3, strokeWidth: 0 }}
-                activeDot={{ r: 5 }}
+                dot={{
+                  r: 3,
+                  fill: CHART_COLORS[rightColorIdx % CHART_COLORS.length],
+                  strokeWidth: 0,
+                }}
+                activeDot={{
+                  r: 5,
+                  fill: CHART_COLORS[rightColorIdx % CHART_COLORS.length],
+                  strokeWidth: 0,
+                }}
               >
                 {showDataLabels && (
                   <LabelList
                     dataKey={rightMetric}
-                    content={trendValueLabelContent(
+                    content={trendLineLabelContent(
                       rightMetric,
                       CHART_COLORS[rightColorIdx % CHART_COLORS.length],
-                      { kind: 'line' }
+                      formattedData,
+                      rightMetric,
+                      {
+                        dualSlot: 'right',
+                        composedWithBar: leftSeriesKind === 'bar',
+                      }
                     )}
                   />
                 )}
@@ -958,6 +1321,7 @@ function ChartRenderer({
                 yAxisId="right"
                 dataKey={rightMetric}
                 name={getFieldDisplayHeader(rightMetric)}
+                hide={dualLegendHidden.right}
                 fill={CHART_COLORS[rightColorIdx % CHART_COLORS.length]}
                 radius={[2, 2, 0, 0]}
                 barSize={18}
@@ -965,10 +1329,16 @@ function ChartRenderer({
                 {showDataLabels && (
                   <LabelList
                     dataKey={rightMetric}
-                    content={trendValueLabelContent(
+                    content={trendBarLabelContent(
                       rightMetric,
                       CHART_COLORS[rightColorIdx % CHART_COLORS.length],
-                      { kind: 'bar', barLabelPriority: 'dual', dualBarSide: 'right' }
+                      {
+                        barLabelPriority: 'dual',
+                        dualBarSide: 'right',
+                        composedWithLine: leftSeriesKind === 'line',
+                        rows: formattedData,
+                        dataKey: rightMetric,
+                      }
                     )}
                   />
                 )}
@@ -1023,31 +1393,39 @@ function ChartRenderer({
               )}
             <Tooltip content={<TrendChartTooltip />} />
             <Legend
-              wrapperStyle={legendWrapperStyle}
+              wrapperStyle={{ ...legendWrapperStyle, cursor: 'pointer' }}
               verticalAlign="top"
               align="center"
-              iconType="line"
+              iconType="circle"
+              iconSize={10}
+              onClick={handleSingleLegendClick}
             />
             {displayMetrics.map((metric) => {
               const colorIdx = metrics.indexOf(metric);
+              const c = CHART_COLORS[colorIdx % CHART_COLORS.length];
               return (
                 <Line
                   key={metric}
                   type="monotone"
                   dataKey={metric}
                   name={getFieldDisplayHeader(metric)}
-                  stroke={CHART_COLORS[colorIdx % CHART_COLORS.length]}
+                  hide={!!singleLegendHidden[metric]}
+                  stroke={c}
                   strokeWidth={2}
-                  dot={{ r: 3, strokeWidth: 0 }}
-                  activeDot={{ r: 5 }}
+                  dot={{ r: 3, fill: c, strokeWidth: 0 }}
+                  activeDot={{ r: 5, fill: c, strokeWidth: 0 }}
                 >
                   {showDataLabels && (
                     <LabelList
                       dataKey={metric}
-                      content={trendValueLabelContent(
+                      content={trendLineLabelContent(
                         metric,
                         CHART_COLORS[colorIdx % CHART_COLORS.length],
-                        { kind: 'line' }
+                        formattedData,
+                        metric,
+                        displayMetrics.length > 1
+                          ? { seriesStackIndex: colorIdx }
+                          : undefined
                       )}
                     />
                   )}
@@ -1072,10 +1450,12 @@ function ChartRenderer({
               )}
             <Tooltip content={<TrendChartTooltip />} />
             <Legend
-              wrapperStyle={legendWrapperStyle}
+              wrapperStyle={{ ...legendWrapperStyle, cursor: 'pointer' }}
               verticalAlign="top"
               align="center"
-              iconType="rect"
+              iconType="circle"
+              iconSize={10}
+              onClick={handleSingleLegendClick}
             />
             {displayMetrics.map((metric) => {
               const colorIdx = metrics.indexOf(metric);
@@ -1084,16 +1464,21 @@ function ChartRenderer({
                   key={metric}
                   dataKey={metric}
                   name={getFieldDisplayHeader(metric)}
+                  hide={!!singleLegendHidden[metric]}
                   fill={CHART_COLORS[colorIdx % CHART_COLORS.length]}
                   radius={[2, 2, 0, 0]}
                 >
                   {showDataLabels && (
                     <LabelList
                       dataKey={metric}
-                      content={trendValueLabelContent(
+                      content={trendBarLabelContent(
                         metric,
                         CHART_COLORS[colorIdx % CHART_COLORS.length],
-                        { kind: 'bar', barLabelPriority: 'single' }
+                        {
+                          barLabelPriority: 'single',
+                          rows: formattedData,
+                          dataKey: metric,
+                        }
                       )}
                     />
                   )}
@@ -1108,7 +1493,12 @@ function ChartRenderer({
 }
 
 // ─── Main Component ────────────────────────────────────────────────────────
-export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps) {
+export function StockTrendAnalysis({
+  data,
+  allFields,
+  serverDatasetIds,
+  localIdbDatasetIds,
+}: StockTrendAnalysisProps) {
   const initialTrend = useMemo(() => loadTrendPersist(), []);
 
   const [dateRange, setDateRange] = useState<DateRange>(
@@ -1142,6 +1532,10 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
     () => initialTrend?.showDataLabels === true
   );
   const [additionalCharts, setAdditionalCharts] = useState<ChartConfig[]>(initialTrend?.additionalCharts ?? []);
+
+  const [localIdbBuf, setLocalIdbBuf] = useState<StockData[]>([]);
+  const [localIdbTrendLoading, setLocalIdbTrendLoading] = useState(false);
+  const [localIdbTrendScanOpts, setLocalIdbTrendScanOpts] = useState<StockOption[]>([]);
 
   useEffect(() => {
     const payload: TrendPersistV1 = {
@@ -1216,6 +1610,206 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
     return found ?? allFields[0] ?? '';
   }, [allFields]);
 
+  const streamStockCols = useMemo(() => {
+    const codeKeywords = ['代码', 'code', 'Code', '股票代码'];
+    const nameKeywords = ['名称', 'name', 'Name', '股票名称'];
+    const code =
+      allFields.find((f) => codeKeywords.some((k) => f.includes(k))) ?? null;
+    const name =
+      allFields.find((f) => nameKeywords.some((k) => f.includes(k))) ?? null;
+    return { code, name };
+  }, [allFields]);
+
+  const serverMode = Boolean(serverDatasetIds?.length);
+  const serverIdsKey = useMemo(
+    () => (serverDatasetIds ?? []).join(','),
+    [serverDatasetIds],
+  );
+
+  const [remoteRows, setRemoteRows] = useState<StockData[]>([]);
+  const [trendLoading, setTrendLoading] = useState(false);
+  const [serverStockOpts, setServerStockOpts] = useState<StockOption[]>([]);
+  const [serverStockDistinctLoading, setServerStockDistinctLoading] = useState(false);
+  const [sampleRow, setSampleRow] = useState<StockData | null>(null);
+
+  useEffect(() => {
+    if (!serverMode || !serverDatasetIds?.length) {
+      setServerStockOpts([]);
+      setServerStockDistinctLoading(false);
+      return;
+    }
+    setServerStockDistinctLoading(true);
+    const ac = new AbortController();
+    void fetchDistinctCodesApi(serverDatasetIds, ac.signal)
+      .then((opts) => {
+        if (ac.signal.aborted) return;
+        setServerStockOpts(
+          opts
+            .map((o) => ({ code: o.code, name: o.name }))
+            .sort((a, b) => a.code.localeCompare(b.code, 'zh-CN')),
+        );
+      })
+      .catch(() => {
+        if (ac.signal.aborted) return;
+        setServerStockOpts([]);
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setServerStockDistinctLoading(false);
+      });
+    return () => ac.abort();
+  }, [serverMode, serverIdsKey, serverDatasetIds]);
+
+  useEffect(() => {
+    if (!serverMode || !serverDatasetIds?.length) {
+      setSampleRow(null);
+      return;
+    }
+    const ac = new AbortController();
+    void queryMergedRowsApi(
+      { datasetIds: serverDatasetIds, page: 1, pageSize: 1 },
+      ac.signal,
+    )
+      .then((r) => setSampleRow(r.data[0] ?? null))
+      .catch(() => setSampleRow(null));
+    return () => ac.abort();
+  }, [serverMode, serverIdsKey, serverDatasetIds]);
+
+  const trendDateEnvelope = useMemo(() => {
+    const candidates: string[] = [];
+    if (dateRange.start) candidates.push(dateRange.start);
+    if (dateRange.end) candidates.push(dateRange.end);
+    additionalCharts.forEach((c) => {
+      if (c.dateFrom) candidates.push(c.dateFrom);
+      if (c.dateTo) candidates.push(c.dateTo);
+    });
+    const sorted = candidates.filter(Boolean).sort();
+    if (sorted.length === 0) {
+      const r = getLast7DaysRange();
+      return { start: r.start, end: r.end };
+    }
+    return { start: sorted[0]!, end: sorted[sorted.length - 1]! };
+  }, [dateRange, additionalCharts]);
+
+  const stocksUnion = useMemo(() => {
+    const s = new Set<string>();
+    selectedStocks.forEach((c) => s.add(c));
+    additionalCharts.forEach((ch) => ch.selectedStocks.forEach((c) => s.add(c)));
+    return Array.from(s);
+  }, [selectedStocks, additionalCharts]);
+
+  const stocksUnionKey = useMemo(() => stocksUnion.join('\u0001'), [stocksUnion]);
+
+  useEffect(() => {
+    if (!serverMode || !serverDatasetIds?.length) {
+      setRemoteRows([]);
+      setTrendLoading(false);
+      return;
+    }
+    if (stocksUnion.length === 0) {
+      setRemoteRows([]);
+      setTrendLoading(false);
+      return;
+    }
+    const ac = new AbortController();
+    setTrendLoading(true);
+    void fetchAllMergedRowsForFilters(
+      {
+        datasetIds: serverDatasetIds,
+        dateFrom: trendDateEnvelope.start,
+        dateTo: trendDateEnvelope.end,
+        codes: stocksUnion,
+        sortField: null,
+        sortDirection: 'asc',
+      },
+      ac.signal,
+    )
+      .then(setRemoteRows)
+      .catch((e) => {
+        if (e instanceof DOMException && e.name === 'AbortError') return;
+        if (e instanceof Error && e.name === 'AbortError') return;
+        toast.error(e instanceof Error ? e.message : '加载趋势数据失败');
+        setRemoteRows([]);
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setTrendLoading(false);
+      });
+    return () => ac.abort();
+  }, [
+    serverMode,
+    serverIdsKey,
+    serverDatasetIds,
+    trendDateEnvelope.start,
+    trendDateEnvelope.end,
+    stocksUnionKey,
+  ]);
+
+  const localIdbTrendMode = !serverMode && Boolean(localIdbDatasetIds?.length);
+  const localIdbTrendKey = useMemo(
+    () => (localIdbDatasetIds ?? []).join(','),
+    [localIdbDatasetIds],
+  );
+
+  useEffect(() => {
+    if (!localIdbTrendMode || !localIdbDatasetIds?.length) {
+      setLocalIdbBuf([]);
+      setLocalIdbTrendScanOpts([]);
+      setLocalIdbTrendLoading(false);
+      return;
+    }
+    if (stocksUnion.length === 0) {
+      setLocalIdbBuf([]);
+      setLocalIdbTrendScanOpts([]);
+      setLocalIdbTrendLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLocalIdbTrendLoading(true);
+    void streamLocalIdbForDataTable(localIdbDatasetIds, {
+      dateField,
+      dateRange: trendDateEnvelope,
+      stockCodeField: streamStockCols.code,
+      selectedStocks: stocksUnion,
+      nameField: streamStockCols.name,
+    })
+      .then(({ filteredRows, stockOptions: opts }) => {
+        if (!cancelled) {
+          setLocalIdbBuf(filteredRows);
+          setLocalIdbTrendScanOpts(
+            opts.map((o) => ({ code: o.code, name: o.name })),
+          );
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          toast.error(e instanceof Error ? e.message : '加载本地数据失败');
+          setLocalIdbBuf([]);
+          setLocalIdbTrendScanOpts([]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLocalIdbTrendLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    localIdbTrendMode,
+    localIdbTrendKey,
+    localIdbDatasetIds,
+    dateField,
+    trendDateEnvelope.start,
+    trendDateEnvelope.end,
+    stocksUnionKey,
+    streamStockCols.code,
+    streamStockCols.name,
+  ]);
+
+  const effectiveData = serverMode
+    ? remoteRows
+    : localIdbTrendMode
+      ? [...data, ...localIdbBuf]
+      : data;
+
   // ── Detect stock identifier field
   const stockFilterField = useMemo(() => {
     const codeField = allFields.find(
@@ -1235,12 +1829,14 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
     // Fallback: first non-numeric field
     return (
       allFields.find((field) => {
-        if (data.length === 0) return false;
-        const val = data[0][field];
+        if (effectiveData.length === 0 && !sampleRow) return false;
+        const row = effectiveData[0] ?? sampleRow;
+        if (!row) return false;
+        const val = row[field];
         return isNaN(Number(val)) && val !== null && val !== '';
       }) ?? allFields[0] ?? ''
     );
-  }, [allFields, data]);
+  }, [allFields, effectiveData, sampleRow]);
 
   // ── Detect secondary name field
   const stockNameField = useMemo(() => {
@@ -1255,9 +1851,13 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
 
   // ── Stock options
   const stockOptions = useMemo((): StockOption[] => {
+    if (serverMode) return serverStockOpts;
+    if (localIdbTrendMode && localIdbTrendScanOpts.length > 0) {
+      return localIdbTrendScanOpts;
+    }
     if (!stockFilterField) return [];
     const map = new Map<string, StockOption>();
-    data.forEach((row) => {
+    effectiveData.forEach((row) => {
       const code = String(row[stockFilterField] ?? '');
       const name = stockNameField ? String(row[stockNameField] ?? '') : code;
       if (code && !map.has(code)) {
@@ -1265,40 +1865,49 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
       }
     });
     return Array.from(map.values()).sort((a, b) => a.code.localeCompare(b.code));
-  }, [data, stockFilterField, stockNameField]);
+  }, [
+    serverMode,
+    serverStockOpts,
+    localIdbTrendMode,
+    localIdbTrendScanOpts,
+    effectiveData,
+    stockFilterField,
+    stockNameField,
+  ]);
 
   // ── Metric fields (numeric columns)
   const metricFields = useMemo(() => {
-    if (data.length === 0) return [];
-    const first = data[0];
+    const first = effectiveData[0] ?? sampleRow;
+    if (!first) return [];
     return allFields.filter((f) => {
       const v = first[f];
       return v !== null && v !== '' && !isNaN(Number(v));
     });
-  }, [allFields, data]);
+  }, [allFields, effectiveData, sampleRow]);
 
-  /** 当前数据集中存在的股票/指标与记忆选择取交集（单股只保留 1 个代码） */
+  /** 当前数据集中存在的股票/指标与记忆选择取交集（单股只保留 1 个代码）；股票/数值列列表未就绪时不清空，避免切换模块或首屏拉数期间抹掉 localStorage 记忆 */
   useEffect(() => {
     const stockCodes =
       stockOptions.length === 0 ? null : new Set(stockOptions.map((o) => o.code));
-    const metricSet = metricFields.length === 0 ? null : new Set(metricFields);
+    const metricSet =
+      metricFields.length === 0 ? null : new Set(metricFields);
 
-    if (stockCodes === null) {
-      setSelectedStocks([]);
-    } else {
+    if (stockCodes !== null) {
       setSelectedStocks((prev) => prev.filter((c) => stockCodes.has(c)).slice(0, 1));
     }
-    if (metricSet === null) {
-      setSelectedMetrics([]);
-    } else {
+    if (metricSet !== null) {
       setSelectedMetrics((prev) => prev.filter((x) => metricSet.has(x)));
     }
     setAdditionalCharts((prev) =>
       prev.map((chart) => {
         const ss =
-          stockCodes === null ? [] : chart.selectedStocks.filter((c) => stockCodes.has(c)).slice(0, 1);
+          stockCodes === null
+            ? chart.selectedStocks
+            : chart.selectedStocks.filter((c) => stockCodes.has(c)).slice(0, 1);
         const sm =
-          metricSet === null ? [] : chart.selectedMetrics.filter((x) => metricSet.has(x));
+          metricSet === null
+            ? chart.selectedMetrics
+            : chart.selectedMetrics.filter((x) => metricSet.has(x));
         let am = chart.activeMetric;
         if (sm.length > 0 && !sm.includes(am)) am = sm[0];
         else if (sm.length === 0) am = '';
@@ -1331,37 +1940,48 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
   // ── Filter data for a chart
   const filterData = (stocks: string[], from: string, to: string) => {
     if (!stockFilterField) return [];
-    let rows = data.filter((row) => stocks.includes(String(row[stockFilterField] ?? '')));
+    let rows = effectiveData.filter((row) =>
+      stocks.includes(String(row[stockFilterField] ?? '')),
+    );
     if (from) rows = rows.filter((row) => String(row[dateField] ?? '') >= from);
     if (to) rows = rows.filter((row) => String(row[dateField] ?? '') <= to);
     return rows.sort((a, b) =>
-      String(a[dateField] ?? '').localeCompare(String(b[dateField] ?? ''))
+      String(a[dateField] ?? '').localeCompare(String(b[dateField] ?? '')),
     );
   };
 
-  const dateRangeLabel = () => {
-    if (!dateRange.start && !dateRange.end) return '选择时间';
-    if (dateRange.start === dateRange.end) return dateRange.start || '选择时间';
-    return `${dateRange.start || '—'} 至 ${dateRange.end || '—'}`;
-  };
-
   const applyDateRange = (range?: DateRange) => {
-    let { start, end } = range ?? tempRange;
-    if (start && end && start > end) [start, end] = [end, start];
-    setDateRange({ start, end });
+    const n = normalizeDateRangeForApply(range ?? tempRange, {
+      emptyToLast7: true,
+      emptyDefaultRange: getLast7DaysRange,
+    });
+    setDateRange(n);
+    setTempRange(n);
     setDatePickerOpen(false);
   };
 
   const clearDateRange = () => {
-    setDateRange({ start: '', end: '' });
-    setTempRange({ start: '', end: '' });
+    const d = getLast7DaysRange();
+    setDateRange(d);
+    setTempRange(d);
     setDatePickerOpen(false);
   };
+
+  const trendDateControlsBusy =
+    (serverMode && trendLoading && stocksUnion.length > 0) ||
+    (localIdbTrendMode && localIdbTrendLoading);
 
   const mainChartData = useMemo(
     () => filterData(selectedStocks, dateRange.start, dateRange.end),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [selectedStocks, dateRange.start, dateRange.end, data, dateField, stockFilterField]
+    [
+      selectedStocks,
+      dateRange.start,
+      dateRange.end,
+      effectiveData,
+      dateField,
+      stockFilterField,
+    ],
   );
 
   // ── Additional charts
@@ -1414,7 +2034,7 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
           {/* 时间范围 + 股票（单指标 / 双指标对比共用） */}
           <div className="flex flex-wrap items-center gap-2">
             <DateRangePickerButton
-              label={dateRangeLabel()}
+              appliedRange={dateRange}
               open={datePickerOpen}
               onOpenChange={(v) => {
                 setDatePickerOpen(v);
@@ -1426,12 +2046,15 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
               onClear={clearDateRange}
               hasDateField={!!dateFieldForPicker}
               hasFilter={!!(dateRange.start || dateRange.end)}
+              busy={trendDateControlsBusy}
+              emptyDefaultRange={getLast7DaysRange}
             />
             <StockSelector
               options={stockOptions}
               selected={selectedStocks}
               onChange={setSelectedStocks}
               isSingleSelect={true}
+              optionsLoading={serverMode && serverStockDistinctLoading}
             />
           </div>
           <MetricsPanel
@@ -1530,48 +2153,54 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
               {selectedMetrics.length >= 2 && viewMode === 'dual' && (
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-2 pt-1">
                   <span className="shrink-0 text-sm text-muted-foreground">左 Y 轴</span>
-                  <select
+                  <Select
                     value={leftMetric}
-                    onChange={(e) => {
-                      const v = e.target.value;
+                    onValueChange={(v) => {
                       setLeftMetric(v);
                       if (v === rightMetric) {
                         const alt = selectedMetrics.find((m) => m !== v);
                         if (alt) setRightMetric(alt);
                       }
                     }}
-                    className="min-w-[120px] max-w-[220px] rounded-md border border-border bg-background px-2 py-1.5 text-[14px]"
                   >
-                    {selectedMetrics.map((m) => (
-                      <option key={m} value={m}>
-                        {getFieldDisplayHeader(m)}
-                      </option>
-                    ))}
-                  </select>
+                    <SelectTrigger className="min-w-[120px] max-w-[220px] border-border text-[14px] h-9">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent position="popper" sideOffset={4}>
+                      {selectedMetrics.map((m) => (
+                        <SelectItem key={m} value={m}>
+                          {getFieldDisplayHeader(m)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                   <DualAxisSeriesTypeToggle
                     value={dualLeftSeriesType}
                     onChange={setDualLeftSeriesType}
                     ariaLabel="左轴图表类型"
                   />
                   <span className="shrink-0 text-sm text-muted-foreground">右 Y 轴</span>
-                  <select
+                  <Select
                     value={rightMetric}
-                    onChange={(e) => {
-                      const v = e.target.value;
+                    onValueChange={(v) => {
                       setRightMetric(v);
                       if (v === leftMetric) {
                         const alt = selectedMetrics.find((m) => m !== v);
                         if (alt) setLeftMetric(alt);
                       }
                     }}
-                    className="min-w-[120px] max-w-[220px] rounded-md border border-border bg-background px-2 py-1.5 text-[14px]"
                   >
-                    {selectedMetrics.map((m) => (
-                      <option key={m} value={m}>
-                        {getFieldDisplayHeader(m)}
-                      </option>
-                    ))}
-                  </select>
+                    <SelectTrigger className="min-w-[120px] max-w-[220px] border-border text-[14px] h-9">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent position="popper" sideOffset={4}>
+                      {selectedMetrics.map((m) => (
+                        <SelectItem key={m} value={m}>
+                          {getFieldDisplayHeader(m)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                   <DualAxisSeriesTypeToggle
                     value={dualRightSeriesType}
                     onChange={setDualRightSeriesType}
@@ -1622,6 +2251,7 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
                     selected={chart.selectedStocks}
                     onChange={(stocks) => updateChart(chart.id, { selectedStocks: stocks })}
                     isSingleSelect={true}
+                    optionsLoading={serverMode && serverStockDistinctLoading}
                   />
                 </div>
                 <Button
@@ -1752,10 +2382,9 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
                   {chart.selectedMetrics.length >= 2 && chart.viewMode === 'dual' && (
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-2 pt-1">
                       <span className="shrink-0 text-sm text-muted-foreground">左 Y 轴</span>
-                      <select
-                        value={chart.leftMetric ?? ''}
-                        onChange={(e) => {
-                          const v = e.target.value;
+                      <Select
+                        value={chart.leftMetric ?? chart.selectedMetrics[0]!}
+                        onValueChange={(v) => {
                           const rm = chart.rightMetric ?? '';
                           const patch: Partial<ChartConfig> = { leftMetric: v };
                           if (v === rm) {
@@ -1764,24 +2393,27 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
                           }
                           updateChart(chart.id, patch);
                         }}
-                        className="min-w-[120px] max-w-[220px] rounded-md border border-border bg-background px-2 py-1.5 text-[14px]"
                       >
-                        {chart.selectedMetrics.map((m) => (
-                          <option key={m} value={m}>
-                            {getFieldDisplayHeader(m)}
-                          </option>
-                        ))}
-                      </select>
+                        <SelectTrigger className="min-w-[120px] max-w-[220px] border-border text-[14px] h-9">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent position="popper" sideOffset={4}>
+                          {chart.selectedMetrics.map((m) => (
+                            <SelectItem key={m} value={m}>
+                              {getFieldDisplayHeader(m)}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                       <DualAxisSeriesTypeToggle
                         value={chart.dualLeftSeriesType ?? chart.chartType}
                         onChange={(v) => updateChart(chart.id, { dualLeftSeriesType: v })}
                         ariaLabel="对比图左轴图表类型"
                       />
                       <span className="shrink-0 text-sm text-muted-foreground">右 Y 轴</span>
-                      <select
-                        value={chart.rightMetric ?? ''}
-                        onChange={(e) => {
-                          const v = e.target.value;
+                      <Select
+                        value={chart.rightMetric ?? chart.selectedMetrics[1]!}
+                        onValueChange={(v) => {
                           const lm = chart.leftMetric ?? '';
                           const patch: Partial<ChartConfig> = { rightMetric: v };
                           if (v === lm) {
@@ -1790,14 +2422,18 @@ export function StockTrendAnalysis({ data, allFields }: StockTrendAnalysisProps)
                           }
                           updateChart(chart.id, patch);
                         }}
-                        className="min-w-[120px] max-w-[220px] rounded-md border border-border bg-background px-2 py-1.5 text-[14px]"
                       >
-                        {chart.selectedMetrics.map((m) => (
-                          <option key={m} value={m}>
-                            {getFieldDisplayHeader(m)}
-                          </option>
-                        ))}
-                      </select>
+                        <SelectTrigger className="min-w-[120px] max-w-[220px] border-border text-[14px] h-9">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent position="popper" sideOffset={4}>
+                          {chart.selectedMetrics.map((m) => (
+                            <SelectItem key={m} value={m}>
+                              {getFieldDisplayHeader(m)}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                       <DualAxisSeriesTypeToggle
                         value={chart.dualRightSeriesType ?? chart.chartType}
                         onChange={(v) => updateChart(chart.id, { dualRightSeriesType: v })}

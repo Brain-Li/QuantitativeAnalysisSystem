@@ -32,8 +32,10 @@ const SelectTrigger = React.forwardRef<
   React.ElementRef<typeof SelectPrimitive.Trigger>,
   React.ComponentPropsWithoutRef<typeof SelectPrimitive.Trigger> & {
     size?: "sm" | "default";
+    /** 右侧下拉箭头样式（如加大、提高对比度） */
+    iconClassName?: string;
   }
->(({ className, size = "default", children, ...props }, ref) => (
+>(({ className, size = "default", iconClassName, children, ...props }, ref) => (
   <SelectPrimitive.Trigger
     ref={ref}
     data-slot="select-trigger"
@@ -46,7 +48,10 @@ const SelectTrigger = React.forwardRef<
   >
     {children}
     <SelectPrimitive.Icon asChild>
-      <ChevronDownIcon className="size-4 opacity-50" />
+      <ChevronDownIcon
+        className={cn("size-4 shrink-0 opacity-50 text-muted-foreground", iconClassName)}
+        aria-hidden
+      />
     </SelectPrimitive.Icon>
   </SelectPrimitive.Trigger>
 ));
